@@ -1,0 +1,93 @@
+name: PC build
+# MoonPixel for PC. The game's core is the iOS repository's (the `core` submodule, pinned to a commit); the
+# bridge (bridge/) makes it a C library, MoonPixelBridge.dll, which the Unreal project (unreal/) draws.
+#
+#   bridge-tests - the bridge's tests on Linux (a world through the C functions, the C layout of a person)
+#   dll          - the DLL on Windows, called from a C program as Unreal's plugin calls it, then the Unreal
+#                  project with the DLL, its import library, the header and the Swift runtime in place:
+#                  MoonPixel-PC.zip, published as the pre-release "pc-latest" (replaced on every build of main)
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+permissions:
+  contents: write
+concurrency:
+  group: pc-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  bridge-tests:
+    runs-on: ubuntu-latest
+    container: swift:6.2.1-noble
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Bridge tests
+        working-directory: bridge
+        run: swift test -c release -Xswiftc -enable-testing --filter MoonPixelBridgeTests
+
+  dll:
+    runs-on: windows-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: compnerd/gha-setup-swift@main
+        with:
+          branch: swift-6.2.1-release
+          tag: 6.2.1-RELEASE
+      - name: Build the DLL
+        working-directory: bridge
+        shell: pwsh
+        run: |
+          swift --version
+          swift build -c release --product MoonPixelBridge 2>&1 | Tee-Object -FilePath build.log
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Get-ChildItem .build\release -Filter "MoonPixelBridge*"
+      - name: Call it from C
+        shell: pwsh
+        run: |
+          $rel = "bridge\.build\release"
+          clang -I bridge\include bridge\smoke\smoke.c "$rel\MoonPixelBridge.lib" -o smoke.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $env:PATH = "$((Resolve-Path $rel).Path);$env:PATH"
+          .\smoke.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Package
+        shell: pwsh
+        run: |
+          $core = "unreal\ThirdParty\MoonPixelCore"
+          New-Item -ItemType Directory -Force "$core\include", "$core\bin", "$core\lib" | Out-Null
+          Copy-Item bridge\.build\release\MoonPixelBridge.dll "$core\bin\"
+          Copy-Item bridge\.build\release\MoonPixelBridge.lib "$core\lib\"
+          Copy-Item bridge\include\moonpixel.h "$core\include\"
+          # the Swift runtime the DLL links against (shipped beside it in the game)
+          $swiftCore = (Get-Command swiftCore.dll -ErrorAction SilentlyContinue).Source
+          if (-not $swiftCore) { $swiftCore = (Get-ChildItem -Recurse "$env:LOCALAPPDATA\Programs\Swift" -Filter swiftCore.dll | Select-Object -First 1).FullName }
+          Get-ChildItem (Split-Path $swiftCore) -Filter *.dll | Copy-Item -Destination "$core\bin\"
+          $pkg = "MoonPixel-PC"
+          Copy-Item -Recurse unreal $pkg
+          Copy-Item README.md "$pkg\README.md"
+          Compress-Archive -Path $pkg -DestinationPath MoonPixel-PC.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MoonPixel-PC
+          path: MoonPixel-PC.zip
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-build-log
+          path: bridge/build.log
+      - name: Publish (pre-release pc-latest)
+        if: github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete pc-latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          gh release create pc-latest MoonPixel-PC.zip --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
+            --title "MoonPixel PC (Unreal project, latest build)" \
+            --notes "The Unreal project for Windows with the game's core built in. How to open it: README.md (Chinese). Built from ${GITHUB_SHA::7}."
