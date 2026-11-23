@@ -6,7 +6,19 @@ import MoonPixelCore
 
 final class WorldHandle {
     let society: Society
+    /// The chunk last meshed (a front end asks for its parts one after another): reused while the world's
+    /// clock has not moved.
+    var lastChunk: (cx: Int32, cy: Int32, time: Double, input: ChunkInput3D, mesh: ChunkMesh3D)?
     init(_ s: Society) { society = s }
+
+    func chunk(_ cx: Int32, _ cy: Int32) -> (input: ChunkInput3D, mesh: ChunkMesh3D) {
+        let w = society.world
+        if let c = lastChunk, c.cx == cx, c.cy == cy, c.time == w.time { return (c.input, c.mesh) }
+        let input = ChunkInput3D(world: w, cx: Int(cx), cy: Int(cy))
+        let mesh = Mesher3D.build(input, gen: w.gen, anime: true)
+        lastChunk = (cx, cy, w.time, input, mesh)
+        return (input, mesh)
+    }
 }
 
 final class MeshHandle {
@@ -14,8 +26,10 @@ final class MeshHandle {
     /// RGBA a vertex: each quad's colour read from the picture its texture coordinates point into, at the
     /// quad's middle (a front end without the core's materials draws with these).
     let colors: [UInt8]
-    init(_ m: Mesh3D, picture: Bitmap?) {
-        mesh = m
+    init(_ m: Mesh3D, colors given: [UInt8]) { mesh = m; colors = given }
+    convenience init(_ m: Mesh3D, picture: Bitmap?) { self.init(m, colors: MeshHandle.colors(m, picture: picture)) }
+
+    static func colors(_ m: Mesh3D, picture: Bitmap?) -> [UInt8] {
         var c = [UInt8](repeating: 255, count: m.positions.count * 4)
         if let b = picture {
             var q = 0
@@ -26,14 +40,15 @@ final class MeshHandle {
                 q += 4
             }
         }
-        colors = c
+        return c
     }
 }
 
 /// The palette the standing parts and people are coloured from.
 let palette = Palette3D.bitmap.animeGraded()
-/// People's rigs by look (built once each: a few milliseconds).
-nonisolated(unsafe) var rigCache: [String: Rig] = [:]
+/// People's rigs by look, with their vertex colours (both built once each: a few milliseconds; posing moves
+/// vertices, never their colours).
+nonisolated(unsafe) var rigCache: [String: (rig: Rig, colors: [UInt8])] = [:]
 
 /// The C layout of `MPPerson` (moonpixel.h); kept in step by `mp_abi` and the bridge's own test.
 struct MPPerson {
@@ -137,9 +152,7 @@ func read<T>(_ field: T) -> String {
 
 @_cdecl("mp_chunk_mesh") public func mp_chunk_mesh(_ p: OpaquePointer?, _ cx: Int32, _ cy: Int32, _ part: Int32) -> OpaquePointer? {
     guard let h = world(p) else { return nil }
-    let w = h.society.world
-    let input = ChunkInput3D(world: w, cx: Int(cx), cy: Int(cy))
-    let cm = Mesher3D.build(input, gen: w.gen, anime: true)
+    let (input, cm) = h.chunk(cx, cy)
     let m = part == 0 ? cm.ground : (part == 1 ? cm.solid : cm.sprites)
     guard !m.isEmpty else { return nil }
     var flipped = m
@@ -150,10 +163,8 @@ func read<T>(_ field: T) -> String {
 
 @_cdecl("mp_chunk_ground_rgba") public func mp_chunk_ground_rgba(_ p: OpaquePointer?, _ cx: Int32, _ cy: Int32, _ out: UnsafeMutablePointer<UInt8>?, _ cap: Int32) -> Int32 {
     guard let h = world(p) else { return 0 }
-    let w = h.society.world
-    let input = ChunkInput3D(world: w, cx: Int(cx), cy: Int(cy))
-    let relief = Mesher3D.build(input, gen: w.gen, anime: true).relief
-    let b = AnimeArt.bakeGround(layers: input.layers, relief: relief)
+    let (input, cm) = h.chunk(cx, cy)
+    let b = AnimeArt.bakeGround(layers: input.layers, relief: cm.relief)
     if let out = out, Int(cap) >= b.px.count { b.px.withUnsafeBufferPointer { out.update(from: $0.baseAddress!, count: b.px.count) } }
     return Int32(b.w)
 }
@@ -199,32 +210,33 @@ func lookOf(_ r: MPPerson) -> Look {
 }
 
 /// A person's rig (cached by look); a character model not rigged yet is drawn as the everyday figure.
-func rigOf(_ r: MPPerson, lite: Bool) -> Rig? {
+func rigOf(_ r: MPPerson, lite: Bool) -> (rig: Rig, colors: [UInt8])? {
     var l = lookOf(r)
     let child = r.flags & MP_CHILD != 0, female = r.flags & MP_FEMALE != 0
     let held = read(r.held)
     let key = "\(l.skin)\(l.hair)\(l.shirt)\(l.pants)\(l.shoes)\(l.style)\(l.model ?? "")\(held)\(child)\(female)\(lite)"
     if let c = rigCache[key] { return c }
-    if Figure3D.animeRig(l, held: held, child: child, female: female, kind: .moe, lite: lite) == nil { l.model = nil }
+    if CharacterModels.of(l.model) != nil { l.model = nil }        // not rigged yet: the everyday figure
     guard let rig = Figure3D.animeRig(l, held: held, child: child, female: female, kind: .moe, lite: lite) else { return nil }
     if rigCache.count > 4000 { rigCache = [:] }
-    rigCache[key] = rig
-    return rig
+    let entry = (rig, MeshHandle.colors(rig.mesh, picture: palette))
+    rigCache[key] = entry
+    return entry
 }
 
 @_cdecl("mp_person_mesh") public func mp_person_mesh(_ p: UnsafeRawPointer?, _ clip: UnsafePointer<CChar>?, _ t: Float, _ lite: Int32) -> OpaquePointer? {
     guard let p = p else { return nil }
     let r = p.load(as: MPPerson.self)
-    guard let rig = rigOf(r, lite: lite != 0) else { return nil }
+    guard let (rig, colors) = rigOf(r, lite: lite != 0) else { return nil }
     let name = clip.map { String(cString: $0) } ?? "idle"
     let m = rig.posed(rig.clip(name) == nil ? "idle" : name, at: t)
-    return OpaquePointer(Unmanaged.passRetained(MeshHandle(m, picture: palette)).toOpaque())
+    return OpaquePointer(Unmanaged.passRetained(MeshHandle(m, colors: colors)).toOpaque())
 }
 
 @_cdecl("mp_person_glb") public func mp_person_glb(_ p: UnsafeRawPointer?, _ out: UnsafeMutablePointer<UInt8>?, _ cap: Int32) -> Int32 {
     guard let p = p else { return 0 }
     let r = p.load(as: MPPerson.self)
-    guard let rig = rigOf(r, lite: false) else { return 0 }
+    guard let rig = rigOf(r, lite: false)?.rig else { return 0 }
     let d = GLTF.glb(rig, name: "person_\(r.id)")
     if let out = out, Int(cap) >= d.count { d.copyBytes(to: out, count: d.count) }
     return Int32(d.count)

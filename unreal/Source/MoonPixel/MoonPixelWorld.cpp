@@ -115,6 +115,16 @@ bool AMoonPixelWorld::FillSection(UProceduralMeshComponent* Component, int32 Sec
 		UV0.Add(FVector2D(UV[i * 2], UV[i * 2 + 1]));
 		Colors.Add(FColor(Rgba[i * 4], Rgba[i * 4 + 1], Rgba[i * 4 + 2], Rgba[i * 4 + 3]));
 	}
+	// the same vertices moved (a person re-posed): only the vertex buffer is sent again, not the triangles
+	if (!bCollision)
+	{
+		const FProcMeshSection* Have = Component->GetProcMeshSection(Section);
+		if (Have && Have->ProcVertexBuffer.Num() == VC && Have->ProcIndexBuffer.Num() == IC)
+		{
+			Component->UpdateMeshSection(Section, Vertices, Normals, UV0, Colors, TArray<FProcMeshTangent>());
+			return true;
+		}
+	}
 	// swapping y and z turns the handedness over: each triangle is wound the other way
 	for (int32 t = 0; t + 2 < IC; t += 3)
 	{
@@ -169,10 +179,12 @@ void AMoonPixelWorld::StreamChunks(const FVector& At)
 					continue;
 				}
 				UProceduralMeshComponent* C = NewObject<UProceduralMeshComponent>(this);
+				C->bUseAsyncCooking = true;               // collision is cooked off the game thread: no hitch
 				C->SetupAttachment(RootComponent);
 				C->RegisterComponent();
+				// the ground is walked on (collision); the standing parts are only seen for now
 				FillSection(C, 0, mp_chunk_mesh(World, K.X, K.Y, 0), true);
-				FillSection(C, 1, mp_chunk_mesh(World, K.X, K.Y, 1), true);
+				FillSection(C, 1, mp_chunk_mesh(World, K.X, K.Y, 1), false);
 				Chunks.Add(K, C);
 				++Made;
 			}
